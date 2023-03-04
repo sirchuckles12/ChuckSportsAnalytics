@@ -1,0 +1,1 @@
+This repo contains code sufficient to create a query-able database of every MLB event in history. We set up this database, then use it to answer various questions of interest to someone who enjoys watching or gambling on MLB baseball games.
