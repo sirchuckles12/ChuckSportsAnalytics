@@ -1,0 +1,230 @@
+---
+title: "Pitcher Stats"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(baseballr)
+library(RPostgres)
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+library(forecast)
+library(quantreg)
+library(knitr)
+```
+
+
+```{r cars, include = FALSE}
+source('../Desktop/GitRepos/ChuckSportsAnalytics/Baseball/mlb/connect-database.R')
+
+s = mlb_schedule(season = 2023, level_ids = "1")
+s = s %>% filter(series_description == 'Regular Season' |
+                   series_description == 'Wild Card Game' |
+                   series_description == 'Division Series'|
+                   series_description == 'League Championship Series' |
+                   series_description == 'World Series')
+#s = s %>% filter(is.na(reschedule_game_date))
+s = s %>% filter(official_date == Sys.Date())
+
+s
+
+```
+
+
+
+```{r, include=FALSE}
+probable_starters = rbindlist(lapply(unique(s$game_pk), function(x) {mlb_probables(x)}))
+probable_starters = probable_starters[!is.na(fullName)]
+
+schedule = data.table(s)
+
+probable_starters_full = merge(probable_starters, schedule[, c('game_pk', 'teams_home_team_name', 'teams_away_team_name'), with = FALSE], by = c('game_pk'))
+probable_starters_full[, home_team := teams_home_team_name]
+probable_starters_full[, fielding_team := team]
+probable_starters_full[, batting_team := ifelse(team == teams_home_team_name, teams_away_team_name, teams_home_team_name)]
+```
+
+```{r, include=FALSE}
+history = dbGetQuery(con, "SELECT p.*, opp_score_end - opp_score_start AS runs_scored, CASE WHEN p.is_home_team = 1 THEN p.fielding_team ELSE p.batting_team END AS home_team
+FROM mlb_pitcher_statistics p
+INNER JOIN mlb_starting_pitcher s ON p.game_pk = s.game_pk AND p.fielding_team = s.fielding_team AND p.pitcher = s.starting_pitcher
+")
+
+history = data.table(history)
+history[, game_date := as.Date(game_date)]
+history = history[order(game_date)]
+
+setnames(probable_starters_full, 'fullName', 'pitcher')
+probable_starters_full[, game_date := as.Date(game_date)]
+probable_starters_full[, is_home_team := ifelse(fielding_team == home_team, 1, 0)]
+new_games = probable_starters_full[, c('game_pk', 'game_date', 'home_team', 'batting_team', 'fielding_team', 'pitcher', 'is_home_team'), with = FALSE]
+
+history = rbind(history, new_games, fill = TRUE)
+```
+
+
+```{r, include=FALSE}
+outs_shift = lm(outs_recorded ~ batting_team + home_team + is_home_team, data = history)
+strikeouts_shift = lm(strikeouts_recorded ~ batting_team + home_team + is_home_team, data = history)
+hits_shift = lm(hits_recorded ~ batting_team + home_team + is_home_team, data = history)
+#fi_hits_shift = lm(fi_hits_recorded ~ batting_team + home_team, data = history)
+walk_shift = lm(walks_recorded ~ batting_team + home_team + is_home_team, data = history)
+
+OUTS_INTERCEPT = outs_shift$coefficients['(Intercept)']
+STRIKEOUTS_INTERCEPT = strikeouts_shift$coefficients['(Intercept)']
+HITS_INTERCEPT = hits_shift$coefficients['(Intercept)']
+WALKS_INTERCEPT = walk_shift$coefficients['(Intercept)']
+#FI_HITS_INTERCEPT = fi_hits_shift$coefficients['(Intercept)']
+
+history[, outs_adjusted := outs_recorded - predict(outs_shift, newdata = .SD) + OUTS_INTERCEPT]
+history[, strikeouts_adjusted := strikeouts_recorded - predict(strikeouts_shift, newdata = .SD) + STRIKEOUTS_INTERCEPT]
+history[, hits_adjusted := hits_recorded - predict(hits_shift, newdata = .SD) + HITS_INTERCEPT]
+history[, walks_adjusted := walks_recorded - predict(walk_shift, newdata = .SD) + WALKS_INTERCEPT]
+#history[, fi_hits_adjusted := fi_hits_recorded - predict(fi_hits_shift, newdata = .SD) + FI_HITS_INTERCEPT]
+```
+
+```{r, include = FALSE, warning = FALSE}
+history[, c('hits_l10_p50', 'hits_l10_p25', 'hits_l10_p75'
+            , 'outs_l10_p50', 'outs_l10_p25', 'outs_l10_p75'
+            , 'strikeouts_l10_p50', 'strikeouts_l10_p25', 'strikeouts_l10_p75'
+            , 'walks_l10_p50', 'walks_l10_p25', 'walks_l10_p75') :=
+          list(frollapply(shift(hits_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.5, na.rm = TRUE),
+               frollapply(shift(hits_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.25, na.rm = TRUE),
+               frollapply(shift(hits_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.75, na.rm = TRUE),
+
+               frollapply(shift(outs_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.5, na.rm = TRUE),
+               frollapply(shift(outs_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.25, na.rm = TRUE),
+               frollapply(shift(outs_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.75, na.rm = TRUE),
+
+               frollapply(shift(strikeouts_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.5, na.rm = TRUE),
+               frollapply(shift(strikeouts_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.25, na.rm = TRUE),
+               frollapply(shift(strikeouts_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.75, na.rm = TRUE),
+               
+               frollapply(shift(walks_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.5, na.rm = TRUE),
+               frollapply(shift(walks_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.25, na.rm = TRUE),
+               frollapply(shift(walks_adjusted, n = 1, type = 'lag'), n = 10, align = 'right', FUN = quantile, probs = 0.75, na.rm = TRUE)
+
+               ),
+        list(pitcher)]
+
+#####
+#Move all the adjustment factors into the model?
+strikeouts_model = rq(strikeouts_adjusted ~ hits_l10_p50 + hits_l10_p25 + hits_l10_p75 +
+                        outs_l10_p50 + outs_l10_p25 + outs_l10_p75 +
+                        strikeouts_l10_p50 + strikeouts_l10_p25 + strikeouts_l10_p75 +
+                        walks_l10_p50 + walks_l10_p25 + walks_l10_p75 +
+                        batting_team + home_team + is_home_team
+                      , data = history, tau = c(0.25, 0.5, 0.75))
+
+outs_model = rq(outs_adjusted ~ hits_l10_p50 + hits_l10_p25 + hits_l10_p75 +
+                        outs_l10_p50 + outs_l10_p25 + outs_l10_p75 +
+                        strikeouts_l10_p50 + strikeouts_l10_p25 + strikeouts_l10_p75 +
+                        walks_l10_p50 + walks_l10_p25 + walks_l10_p75 +
+                        batting_team + home_team + is_home_team
+                      , data = history, tau = c(0.25, 0.5, 0.75))
+
+walks_model = rq(walks_adjusted ~ hits_l10_p50 + hits_l10_p25 + hits_l10_p75 +
+                        outs_l10_p50 + outs_l10_p25 + outs_l10_p75 +
+                        strikeouts_l10_p50 + strikeouts_l10_p25 + strikeouts_l10_p75 +
+                        walks_l10_p50 + walks_l10_p25 + walks_l10_p75 +
+                        batting_team + home_team + is_home_team
+                      , data = history, tau = c(0.25, 0.5, 0.75))
+
+hits_model = rq(hits_adjusted ~ hits_l10_p50 + hits_l10_p25 + hits_l10_p75 +
+                        outs_l10_p50 + outs_l10_p25 + outs_l10_p75 +
+                        strikeouts_l10_p50 + strikeouts_l10_p25 + strikeouts_l10_p75 +
+                        walks_l10_p50 + walks_l10_p25 + walks_l10_p75 +
+                        batting_team + home_team + is_home_team
+                      , data = history, tau = c(0.25, 0.5, 0.75))
+```
+
+```{r, echo = FALSE, warning = FALSE, results = 'asis'}
+#Get adjustments for this game
+#probable_starters_full[, outs_adjustment := predict(outs_shift, newdata = .SD) - OUTS_INTERCEPT]
+#probable_starters_full[, strikeouts_adjustment := predict(strikeouts_shift, newdata = .SD) - STRIKEOUTS_INTERCEPT]
+#probable_starters_full[, hits_adjustment := predict(hits_shift, newdata = .SD) - HITS_INTERCEPT]
+#probable_starters_full[, fi_hits_adjustment := predict(fi_hits_shift, newdata = .SD) - FI_HITS_INTERCEPT]
+
+history[, c('outs_pred_25', 'outs_pred_50', 'outs_pred_75') := 
+                 list(predict(outs_model, newdata = .SD)[, 1],
+                      predict(outs_model, newdata = .SD)[, 2],
+                      predict(outs_model, newdata = .SD)[, 3])]
+
+history[, c('strikeouts_pred_25', 'strikeouts_pred_50', 'strikeouts_pred_75') := 
+                 list(predict(strikeouts_model, newdata = .SD)[, 1],
+                      predict(strikeouts_model, newdata = .SD)[, 2],
+                      predict(strikeouts_model, newdata = .SD)[, 3])]
+
+history[, c('hits_pred_25', 'hits_pred_50', 'hits_pred_75') := 
+                 list(predict(hits_model, newdata = .SD)[, 1],
+                      predict(hits_model, newdata = .SD)[, 2],
+                      predict(hits_model, newdata = .SD)[, 3])]
+  
+history[, c('walks_pred_25', 'walks_pred_50', 'walks_pred_75') := 
+                 list(predict(walks_model, newdata = .SD)[, 1],
+                      predict(walks_model, newdata = .SD)[, 2],
+                      predict(walks_model, newdata = .SD)[, 3])]
+  
+write.csv(history, paste0('predictions-', Sys.Date(), '.csv'))
+
+for (fname in probable_starters$fullName) {
+
+  this_pitcher = copy(history[pitcher == fname])
+
+  if(this_pitcher[, .N] == 0){
+    next
+  }
+  
+#  this_pitcher[, c('outs_pred_25', 'outs_pred_50', 'outs_pred_75') := 
+#                 list(predict(outs_model, newdata = .SD)[, 1],
+#                      predict(outs_model, newdata = .SD)[, 2],
+#                      predict(outs_model, newdata = .SD)[, 3])]
+
+#  this_pitcher[, c('strikeouts_pred_25', 'strikeouts_pred_50', 'strikeouts_pred_75') := 
+#                 list(predict(strikeouts_model, newdata = .SD)[, 1],
+#                      predict(strikeouts_model, newdata = .SD)[, 2],
+#                      predict(strikeouts_model, newdata = .SD)[, 3])]
+
+#  this_pitcher[, c('hits_pred_25', 'hits_pred_50', 'hits_pred_75') := 
+#                 list(predict(hits_model, newdata = .SD)[, 1],
+#                      predict(hits_model, newdata = .SD)[, 2],
+#                      predict(hits_model, newdata = .SD)[, 3])]
+  
+#  this_pitcher[, c('fi_hits_pred_25', 'fi_hits_pred_50', 'fi_hits_pred_75') := 
+#                 list(predict(fi_hits_model, newdata = .SD)[, 1],
+#                      predict(fi_hits_model, newdata = .SD)[, 2],
+#                      predict(fi_hits_model, newdata = .SD)[, 3])]
+  
+  g1 = ggplot(aes(x = outs_adjusted, y = strikeouts_adjusted), data = this_pitcher) +
+    geom_jitter() + ggtitle(paste0(fname, " Strikeouts / Outs")) + scale_x_continuous(breaks = c(9, 12, 15, 18, 21, 24, 27)) +
+    geom_segment(aes(x = outs_pred_50, xend = outs_pred_50, y = strikeouts_pred_25, yend = strikeouts_pred_75), color = 'red', data = this_pitcher[game_date == Sys.Date()]) + 
+    geom_segment(aes(x = outs_pred_25, xend = outs_pred_75, y = strikeouts_pred_50, yend = strikeouts_pred_50), color = 'red', data = this_pitcher[game_date == Sys.Date()])
+
+  
+  g2 = ggplot(aes(x = outs_adjusted, y = hits_adjusted), data = this_pitcher) +
+    geom_jitter() + ggtitle(paste0(fname, " Hits / Outs")) + scale_x_continuous(breaks = c(9, 12, 15, 18, 21, 24, 27)) +
+    geom_segment(aes(x = outs_pred_50, xend = outs_pred_50, y = hits_pred_25, yend = hits_pred_75), color = 'red', data = this_pitcher[game_date == Sys.Date()]) + 
+    geom_segment(aes(x = outs_pred_25, xend = outs_pred_75, y = hits_pred_50, yend = hits_pred_50), color = 'red', data = this_pitcher[game_date == Sys.Date()])
+
+
+  g3 = ggplot(aes(x = strikeouts_adjusted, y = hits_adjusted), data = this_pitcher) +
+    geom_jitter() + ggtitle(paste0(fname, " Hits / Strikeouts")) + 
+    geom_segment(aes(x = strikeouts_pred_50, xend = strikeouts_pred_50, y = hits_pred_25, yend = hits_pred_75), color = 'red', data = this_pitcher[game_date == Sys.Date()]) + 
+    geom_segment(aes(x = strikeouts_pred_25, xend = strikeouts_pred_75, y = hits_pred_50, yend = hits_pred_50), color = 'red', data = this_pitcher[game_date == Sys.Date()])
+
+
+  tmp_melt = melt(this_pitcher, id.vars = c('game_date', 'pitcher'), measure.vars = c('outs_adjusted', 'hits_adjusted', 'strikeouts_adjusted'))
+  g4 = ggplot(aes(x = game_date, y = value, group = variable, color = variable), data = tmp_melt) + 
+    geom_line() + geom_point() + ggtitle(paste0(fname, " Trend")) + theme(legend.position="bottom") + 
+    scale_y_continuous(breaks = c(3, 6, 9, 12, 15, 18, 21, 24, 27))
+  
+  grid.arrange(g1, g2, g3, g4, nrow = 2)
+  
+  printable = melt(this_pitcher[game_date == Sys.Date()], id.vars = c('game_pk', 'game_date', 'home_team', 'fielding_team', 'pitcher'), measure.vars = c('outs_pred_25', 'outs_pred_50', 'outs_pred_75', 'strikeouts_pred_25', 'strikeouts_pred_50', 'strikeouts_pred_75','hits_pred_25', 'hits_pred_50', 'hits_pred_75', 'walks_pred_25', 'walks_pred_50', 'walks_pred_75'))
+                   
+  print(knitr::kable(printable))
+}
+```
